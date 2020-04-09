@@ -776,6 +776,11 @@ def output_members(cluster, name, extended=False, fmt='pretty'):
                 info += '\n{0:>24}: {1}'.format(name, cluster['scheduled_switchover'][name])
         service_info.append(info)
 
+    if cluster.get('sync'):
+        service_info.append('Quorum requires {0} out of members {1}'.format(
+            cluster['sync']['quorum'],
+            ', '.join(cluster['sync']['members'])))
+
     if service_info:
         click.echo(' ' + '\n '.join(service_info))
 

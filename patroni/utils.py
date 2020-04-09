@@ -385,7 +385,7 @@ def cluster_as_json(cluster):
         if m.name == leader_name:
             config = cluster.config.data if cluster.config and cluster.config.modify_index else {}
             role = 'standby_leader' if is_standby_cluster(config.get('standby_cluster')) else 'leader'
-        elif m.name == cluster.sync.sync_standby:
+        elif cluster.sync.matches(m.name):
             role = 'sync_standby'
         else:
             role = 'replica'
@@ -420,6 +420,11 @@ def cluster_as_json(cluster):
             ret['scheduled_switchover']['from'] = cluster.failover.leader
         if cluster.failover.candidate:
             ret['scheduled_switchover']['to'] = cluster.failover.candidate
+    if cluster.sync:
+        ret['sync'] = {
+            'quorum': cluster.sync.quorum,
+            'members': sorted(cluster.sync.members),
+        }
     return ret
 
 

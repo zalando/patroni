@@ -10,6 +10,8 @@ from patroni.async_executor import CriticalTask
 from patroni.dcs import Cluster, ClusterConfig, Member, RemoteMember, SyncState
 from patroni.exceptions import PostgresConnectionException, PatroniException
 from patroni.postgresql import Postgresql, STATE_REJECT, STATE_NO_RESPONSE
+from patroni.postgresql.config import quote_ident
+from patroni.postgresql.misc import parse_sync_standby_names
 from patroni.postgresql.postmaster import PostmasterProcess
 from patroni.postgresql.slots import SlotsHandler
 from patroni.utils import RetryFailedError
@@ -562,7 +564,7 @@ class TestPostgresql(BaseTestPostgresql):
             self.p._state = 'starting'
             self.assertIsNone(self.p.wait_for_startup())
 
-    def test_pick_sync_standby(self):
+    def dont_test_pick_sync_standby(self):
         cluster = Cluster(True, None, self.leader, 0, [self.me, self.other, self.leadermem], None,
                           SyncState(0, self.me.name, self.leadermem.name), None)
 
@@ -596,38 +598,86 @@ class TestPostgresql(BaseTestPostgresql):
         with patch.object(Postgresql, "query", return_value=[]):
             self.assertEqual(self.p.pick_synchronous_standby(cluster), (None, False))
 
-    def test_set_sync_standby(self):
+    def test_current_sync_state(self):
+        self.p.name = self.me.name
+        mock_cursor = Mock()
+        mock_result = mock_cursor.fetchone = Mock()
+        mock_cluster = Mock()
+ 
+        with patch.object(Postgresql, "query", side_effect=[mock_cursor, [
+                (self.other.name, 'streaming', 'sync'),
+                (self.leadermem.name, 'streaming', 'async'),
+            ]]):
+            mock_result.return_value = ['ANY 1 ({0})'.format(quote_ident(self.other.name))]
+            mock_cluster.members = [self.me, self.other]
+            self.assertEqual(self.p.current_sync_state(mock_cluster), {
+                'active': {self.me.name, self.other.name},
+                'numsync': 2,
+                'sync': {self.me.name, self.other.name}
+            })
+
+        with patch.object(Postgresql, "query", side_effect=[mock_cursor, [
+                (self.other.name, 'streaming', 'sync'),
+                (self.leadermem.name, 'streaming', 'async'),
+            ]]):
+            mock_result.return_value = ['']
+            mock_cluster.members = [self.me, self.other, self.leadermem]
+            self.assertEqual(self.p.current_sync_state(mock_cluster), {
+                'active': {self.me.name, self.other.name, self.leadermem.name},
+                'numsync': 1,
+                'sync': {self.me.name}
+            })
+
+    def test_parse_sync_standby_names(self):
+        self.assertEqual(parse_sync_standby_names(" FIRST   1  (   foo ,bar )   "),
+            {'type': 'priority', 'num': 1, 'members': ['foo', 'bar']})
+        self.assertEqual(parse_sync_standby_names("ANY 3 (5)"),
+            {'type': 'quorum', 'num': 3, 'members': ['5']})
+        self.assertEqual(parse_sync_standby_names('1("asdf asdf")'),
+            {'type': 'priority', 'num': 1, 'members': ['asdf asdf']})
+        self.assertEqual(parse_sync_standby_names('a,1'),
+            {'type': 'priority', 'num': 1, 'members': ['a','1']})
+        self.assertEqual(parse_sync_standby_names('*'),
+            {'type': 'priority', 'num': 1, 'members': ['*'], 'has_star': True})
+        self.assertRaises(ValueError, parse_sync_standby_names, '()')
+
+    def test_set_synchronous_state(self):
         def value_in_conf():
             with open(os.path.join(self.p.data_dir, 'postgresql.conf')) as f:
                 for line in f:
                     if line.startswith('synchronous_standby_names'):
                         return line.strip()
 
-        mock_reload = self.p.reload = Mock()
-        self.p.config.set_synchronous_standby('n1')
-        self.assertEqual(value_in_conf(), "synchronous_standby_names = 'n1'")
-        mock_reload.assert_called()
+        with patch.object(Postgresql, 'use_quorum_commit', True):
+            mock_reload = self.p.reload = Mock()
+            self.p.config.set_synchronous_state(2, set(['postgresql0', 'n1']))
+            self.assertEqual(value_in_conf(), "synchronous_standby_names = 'ANY 1 (n1)'")
+            mock_reload.assert_called()
 
-        mock_reload.reset_mock()
-        self.p.config.set_synchronous_standby('n1')
-        mock_reload.assert_not_called()
-        self.assertEqual(value_in_conf(), "synchronous_standby_names = 'n1'")
+            mock_reload.reset_mock()
+            self.p.config.set_synchronous_state(2, set(['postgresql0', 'n1']))
+            mock_reload.assert_not_called()
+            self.assertEqual(value_in_conf(), "synchronous_standby_names = 'ANY 1 (n1)'")
 
-        self.p.config.set_synchronous_standby('n2')
-        mock_reload.assert_called()
-        self.assertEqual(value_in_conf(), "synchronous_standby_names = 'n2'")
+            self.p.config.set_synchronous_state(2, set(['postgresql0', 'n2']))
+            mock_reload.assert_called()
+            self.assertEqual(value_in_conf(), "synchronous_standby_names = 'ANY 1 (n2)'")
 
-        mock_reload.reset_mock()
-        self.p.config.set_synchronous_standby(None)
-        mock_reload.assert_called()
-        self.assertEqual(value_in_conf(), None)
+            self.p.config.set_synchronous_state(2, set(['postgresql0', 'n2', 'n3']))
+            self.assertEqual(value_in_conf(), "synchronous_standby_names = 'ANY 1 (n2, n3)'")
+
+
+            mock_reload.reset_mock()
+            self.p.config.set_synchronous_state(None)
+            mock_reload.assert_called()
+            self.assertEqual(value_in_conf(), None)
 
     def test_get_server_parameters(self):
         config = {'synchronous_mode': True, 'parameters': {'wal_level': 'hot_standby'}, 'listen': '0'}
         self.p.config.get_server_parameters(config)
         config['synchronous_mode_strict'] = True
         self.p.config.get_server_parameters(config)
-        self.p.config.set_synchronous_standby('foo')
+        self.p.config.set_synchronous_state(2, set(['postgresql0']))
         self.assertTrue(str(self.p.config.get_server_parameters(config)).startswith('{'))
 
     @patch('time.sleep', Mock())

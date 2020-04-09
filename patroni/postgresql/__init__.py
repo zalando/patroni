@@ -13,7 +13,7 @@ from patroni.postgresql.bootstrap import Bootstrap
 from patroni.postgresql.cancellable import CancellableSubprocess
 from patroni.postgresql.config import ConfigHandler
 from patroni.postgresql.connection import Connection, get_connection_cursor
-from patroni.postgresql.misc import parse_history, postgres_major_version_to_int
+from patroni.postgresql.misc import parse_history, postgres_major_version_to_int, parse_sync_standby_names
 from patroni.postgresql.postmaster import PostmasterProcess
 from patroni.postgresql.slots import SlotsHandler
 from patroni.exceptions import PostgresConnectionException
@@ -131,6 +131,14 @@ class Postgresql(object):
     @property
     def lsn_name(self):
         return 'lsn' if self._major_version >= 100000 else 'location'
+
+    @property
+    def use_quorum_commit(self):
+        return self._major_version >= 100000
+
+    @property
+    def use_multiple_sync(self):
+        return self._major_version >= 90600
 
     @property
     def cluster_info_query(self):
@@ -806,20 +814,18 @@ class Postgresql(object):
             logger.exception('Could not remove data directory %s', self._data_dir)
             self.move_data_directory()
 
-    def pick_synchronous_standby(self, cluster):
-        """Finds the best candidate to be the synchronous standby.
+    def current_sync_state(self, cluster):
+        """Returns current synchronous replication state as a dict:
+        * numsync: number of synchronous nodes requested(including leader)
+        * sync: set of nodes potentially being synced to
+        * active: set of nodes that are sync capable
+         """
+        sync_standby_names = self.query("SHOW synchronous_standby_names").fetchone()[0]
+        ssn_data = parse_sync_standby_names(sync_standby_names)
 
-        Current synchronous standby is always preferred, unless it has disconnected or does not want to be a
-        synchronous standby any longer.
-
-        :returns tuple of candidate name or None, and bool showing if the member is the active synchronous standby.
-        """
-        current = cluster.sync.sync_standby
-        current = current.lower() if current else current
+        active = [self.name]
         members = {m.name.lower(): m for m in cluster.members}
-        candidates = []
-        # Pick candidates based on who has flushed WAL farthest.
-        # TODO: for synchronous_commit = remote_write we actually want to order on write_location
+
         for app_name, state, sync_state in self.query(
                 "SELECT pg_catalog.lower(application_name), state, sync_state"
                 " FROM pg_catalog.pg_stat_replication"
@@ -827,17 +833,13 @@ class Postgresql(object):
             member = members.get(app_name)
             if state != 'streaming' or not member or member.tags.get('nosync', False):
                 continue
-            if sync_state == 'sync':
-                return member.name, True
-            if sync_state == 'potential' and app_name == current:
-                # Prefer current even if not the best one any more to avoid indecisivness and spurious swaps.
-                return cluster.sync.sync_standby, False
-            if sync_state in ('async', 'potential'):
-                candidates.append(member.name)
+            active.append(member.name)
 
-        if candidates:
-            return candidates[0], False
-        return None, False
+        return {
+            'active': set(active),
+            'numsync': ssn_data['num'] + 1 if not ssn_data.get('has_star') else 1,
+            'sync': set([self.name] + ssn_data['members']).difference(['*']),
+        }
 
     def read_postmaster_opts(self):
         """returns the list of option names/values from postgres.opts, Empty dict if read failed or no file"""

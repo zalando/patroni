@@ -1,4 +1,5 @@
 import logging
+import re
 
 from patroni.exceptions import PostgresException
 
@@ -68,3 +69,68 @@ def parse_history(data):
                 yield values
             except (IndexError, ValueError):
                 logger.exception('Exception when parsing timeline history line "%s"', values)
+
+
+def pairwise(seq):
+    it = iter(list(seq)+[None])
+    return zip(it, it)
+
+
+sync_rep_parser_re = re.compile(r"""
+           (?P<first> [fF][iI][rR][sS][tT] )
+         | (?P<any> [aA][nN][yY] )
+         | (?P<space> \s+ )
+         | (?P<ident> [A-Za-z_][A-Za-z_0-9\$]* )
+         | (?P<dquot> " (?: [^"]+ | "" )* " )
+         | (?P<star> [*] )
+         | (?P<num> \d+ )
+         | (?P<comma> , )
+         | (?P<parenstart> \( )
+         | (?P<parenend> \) )
+         | (?P<JUNK> . )
+        """, re.X)
+
+
+def parse_sync_standby_names(sync_standby_names):
+    """Parse postgresql synchronous_standby_names to constituent parts.
+
+    Returns dict with the following keys:
+    * type: 'quorum'|'priority'
+    * num: int
+    * members: list[str]
+    * has_star: bool - Present if true
+
+    If the configuration value can not be parsed, raises a ValueError.
+    """
+    tokens = [(m.lastgroup, m.group(0), m.start())
+              for m in sync_rep_parser_re.finditer(sync_standby_names)
+              if m.lastgroup != 'space']
+    if not tokens:
+        return {'type': 'off', 'num': 0, 'members': []}
+
+    if [t[0] for t in tokens[0:3]] == ['any', 'num', 'parenstart'] and tokens[-1][0] == 'parenend':
+        result = {'type': 'quorum', 'num': int(tokens[1][1])}
+        synclist = tokens[3:-1]
+    elif [t[0] for t in tokens[0:3]] == ['first', 'num', 'parenstart'] and tokens[-1][0] == 'parenend':
+        result = {'type': 'priority', 'num': int(tokens[1][1])}
+        synclist = tokens[3:-1]
+    elif [t[0] for t in tokens[0:2]] == ['num', 'parenstart'] and tokens[-1][0] == 'parenend':
+        result = {'type': 'priority', 'num': int(tokens[0][1])}
+        synclist = tokens[2:-1]
+    else:
+        result = {'type': 'priority', 'num': 1}
+        synclist = tokens
+    result['members'] = []
+    for (a_type, a_value, a_pos), token_b in pairwise(synclist):
+        if a_type in ['ident', 'num']:
+            result['members'].append(a_value)
+        elif a_type == 'star':
+            result['members'].append(a_value)
+            result['has_star'] = True
+        elif a_type == 'dquot':
+            result['members'].append(a_value[1:-1].replace('""', '"'))
+        else:
+            raise ValueError("Unparseable synchronous_standby_names value %r: Unexpected token %s %r at %d" %
+                             (sync_standby_names, a_type, a_value, a_pos))
+
+    return result

@@ -980,19 +980,48 @@ class ConfigHandler(object):
         else:
             logger.info('No PostgreSQL configuration items changed, nothing to reload.')
 
-    def set_synchronous_standby(self, name):
-        """Sets a node to be synchronous standby and if changed does a reload for PostgreSQL."""
-        if name and name != '*':
-            name = quote_ident(name)
-        if name != self._synchronous_standby_names:
-            if name is None:
+    def set_synchronous_state(self, num, sync=None):
+        """Updates synchronization state.
+
+        Parameters:
+        `num` specifies number of nodes in sync (including leader).
+        `sync` - set of nodes to sync to, including leader.
+
+        Number of nodes in sync can be bigger than the set to sync to. Committers will then have to wait for a new
+        replica to become sync. As a special case with num >= 2 and no standbys, synchronous_standby_names will get
+        set to `*`. Such a state will only be enabled with a 1/1 quorum and minimum_replication_factor >= 2. The
+        state parses as 1/1 sync and if any node appears the sync state will first get changed. At worst any unknown
+        node being synced to will be unknown to Patroni and we will not be able to promote it on leader failure. This
+        can happen anyway in the case if one of the nodes is configured with nofailover, but without nosync.
+
+        TODO: Should we have a special synchronization mode that requires that all nodes that accept synchronization
+        must also be eligible for failover?
+        """
+
+        if num == 1 or num is None:
+            # Turn off sync replication
+            assert not sync or sync == {self._postgresql.name}
+            ssn = None
+        else:
+            assert self._postgresql.name in sync
+            sync_standbys = sync.difference([self._postgresql.name])
+            standby_list = ", ".join(sorted(map(quote_ident, sync_standbys))) if sync_standbys else "*"
+            if self._postgresql.use_multiple_sync:
+                ssn = "{0}{1} ({2})".format("ANY " if self._postgresql.use_quorum_commit else "", num - 1, standby_list)
+            else:
+                assert num == 2
+                ssn = standby_list
+
+        if ssn != self._synchronous_standby_names:
+            if ssn is None:
                 self._server_parameters.pop('synchronous_standby_names', None)
             else:
-                self._server_parameters['synchronous_standby_names'] = name
-            self._synchronous_standby_names = name
+                self._server_parameters['synchronous_standby_names'] = ssn
+            self._synchronous_standby_names = ssn
             if self._postgresql.state == 'running':
                 self.write_postgresql_conf()
                 self._postgresql.reload()
+                # TODO: wait for configuration change to be applied
 
     @property
     def effective_configuration(self):
